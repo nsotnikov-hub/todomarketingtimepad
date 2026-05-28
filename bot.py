@@ -1,8 +1,8 @@
 """
-Telegram Task Bot
-=================
-Принимает задачи в markdown-формате от администратора,
-рассылает персональные чеклисты с кнопками каждому участнику.
+Telegram Task Bot — Native Checklist Edition
+=============================================
+Отправляет задачи как нативные чеклисты Telegram (не кнопки).
+Пользователи отмечают пункты прямо в Telegram, бот отслеживает изменения.
 """
 
 import logging
@@ -11,13 +11,14 @@ import re
 import sqlite3
 from datetime import datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import httpx
+from telegram import Update
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -28,10 +29,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])  # твой Telegram user ID
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 DB_PATH = os.environ.get("DB_PATH", "tasks.db")
 
-ME_ALIASES = {"я (мои задачи)", "я", "мои задачи"}  # секции, которые идут админу
+ME_ALIASES = {"я (мои задачи)", "я", "мои задачи"}
 
 
 # ─── База данных ───────────────────────────────────────────────────────────────
@@ -50,14 +51,15 @@ def init_db():
                 created   TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS tasks (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                batch_id    INTEGER NOT NULL REFERENCES batches(id),
-                person      TEXT NOT NULL,
-                text        TEXT NOT NULL,
-                date        TEXT,
-                done        INTEGER NOT NULL DEFAULT 0,
-                msg_id      INTEGER,
-                msg_chat_id INTEGER
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id      INTEGER NOT NULL REFERENCES batches(id),
+                tg_task_id    INTEGER NOT NULL,  -- id внутри чеклиста Telegram
+                person        TEXT NOT NULL,
+                text          TEXT NOT NULL,
+                date          TEXT,
+                done          INTEGER NOT NULL DEFAULT 0,
+                msg_id        INTEGER,
+                msg_chat_id   INTEGER
             );
         """)
 
@@ -71,13 +73,6 @@ def db():
 # ─── Парсинг markdown ──────────────────────────────────────────────────────────
 
 def parse_tasks(text: str) -> dict[str, list[dict]]:
-    """
-    Разбирает формат:
-        **Имя**
-        - [ ] задача (дата)
-        - [ ] другая задача
-    Возвращает {person: [{text, date}, ...]}
-    """
     sections: dict[str, list[dict]] = {}
     current = None
     for line in text.splitlines():
@@ -99,28 +94,42 @@ def parse_tasks(text: str) -> dict[str, list[dict]]:
     return sections
 
 
-# ─── Сборка сообщения с кнопками ──────────────────────────────────────────────
+# ─── Telegram Checklist API ────────────────────────────────────────────────────
 
-def build_message(person: str, batch_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT id, text, date, done FROM tasks WHERE batch_id=? AND person=?",
-            (batch_id, person),
-        ).fetchall()
-
-    done_n = sum(1 for r in rows if r["done"])
-    total = len(rows)
-
-    header = f"📋 *{person}*\n_{done_n} из {total} выполнено_\n"
-    keyboard = []
-    for r in rows:
-        icon = "✅" if r["done"] else "☐"
-        label = f"{icon} {r['text']}"
-        if r["date"]:
-            label += f" ({r['date']})"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"t:{r['id']}")])
-
-    return header, InlineKeyboardMarkup(keyboard)
+async def send_checklist(chat_id: int, title: str, tasks: list[dict]) -> dict:
+    """
+    Отправляет нативный чеклист Telegram через Bot API 9.0+.
+    others_can_mark_tasks_as_done=True — коллеги могут отмечать задачи.
+    """
+    tg_tasks = [
+        {
+            "id": i + 1,
+            "text": (t["text"] + (f" ({t['date']})" if t.get("date") else ""))[:100],
+        }
+        for i, t in enumerate(tasks[:30])
+    ]
+    payload = {
+        "chat_id": chat_id,
+        "checklist": {
+            "title": title[:255],
+            "tasks": tg_tasks,
+            "others_can_mark_tasks_as_done": True,
+        },
+    }
+    logger.info(f"sendChecklist → chat_id={chat_id}, title={title!r}, {len(tg_tasks)} tasks")
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendChecklist",
+                json=payload,
+            )
+            data = r.json()
+            if not data.get("ok"):
+                logger.error(f"sendChecklist error: {data}")
+            return data
+    except Exception as e:
+        logger.error(f"sendChecklist exception: {e}")
+        return {"ok": False, "description": str(e)}
 
 
 # ─── Команды ──────────────────────────────────────────────────────────────────
@@ -130,20 +139,17 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     with db() as conn:
-        existing = conn.execute(
-            "SELECT name FROM users WHERE chat_id=?", (chat_id,)
-        ).fetchone()
+        existing = conn.execute("SELECT name FROM users WHERE chat_id=?", (chat_id,)).fetchone()
 
     if existing:
         await update.message.reply_text(
             f"👋 Ты уже зарегистрирован как *{existing['name']}*.\n"
-            f"Если нужно сменить имя — /link НовоеИмя\n"
-            f"Твои задачи — /status",
+            "Изменить имя — /link НовоеИмя\n"
+            "Твои задачи — /status",
             parse_mode="Markdown",
         )
         return
 
-    # Регистрируем с именем из Telegram
     name = user.first_name
     if user.last_name:
         name += f" {user.last_name}"
@@ -155,22 +161,21 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     await update.message.reply_text(
-        f"👋 Привет, *{name}*! Ты зарегистрирован.\n\n"
-        f"Если в задачах тебя зовут иначе (например, просто «Антон»), "
-        f"напиши:\n`/link Антон`\n\n"
-        f"Задачи будут приходить сюда автоматически ✅",
+        f"👋 Привет, *{name}*! Зарегистрирован.\n\n"
+        "Если в задачах тебя зовут иначе, напиши:\n`/link Антон`\n\n"
+        "Задачи будут приходить автоматически ✅",
         parse_mode="Markdown",
     )
 
 
 async def cmd_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     if not ctx.args:
         await update.message.reply_text("Используй: /link Антон")
         return
     name = " ".join(ctx.args)
+    user = update.effective_user
+    chat_id = update.effective_chat.id
     with db() as conn:
-        user = update.effective_user
         conn.execute(
             "INSERT OR REPLACE INTO users (chat_id, username, name, created) VALUES (?,?,?,?)",
             (chat_id, user.username or "", name, datetime.now().isoformat()),
@@ -198,9 +203,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"{icon} *{r['person']}*: {done_n}/{total}  `{bar}`")
             await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
-            user_row = conn.execute(
-                "SELECT name FROM users WHERE chat_id=?", (chat_id,)
-            ).fetchone()
+            user_row = conn.execute("SELECT name FROM users WHERE chat_id=?", (chat_id,)).fetchone()
             if not user_row:
                 await update.message.reply_text("Сначала напиши /start")
                 return
@@ -222,6 +225,31 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Отправляет тестовый чеклист — проверяет, работает ли API."""
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    result = await send_checklist(
+        chat_id=ADMIN_ID,
+        title="Тест чеклиста",
+        tasks=[
+            {"text": "Задача 1 — отметь меня", "date": None},
+            {"text": "Задача 2 — и меня тоже", "date": None},
+        ],
+    )
+    if result.get("ok"):
+        await update.message.reply_text("✅ Чеклист отправлен! Проверь сообщение выше.")
+    else:
+        desc = result.get("description", "неизвестная ошибка")
+        await update.message.reply_text(
+            f"❌ Ошибка API: `{desc}`\n\n"
+            "Возможные причины:\n"
+            "• Telegram не обновлён до версии с поддержкой чеклистов\n"
+            "• Bot API сервер не поддерживает sendChecklist",
+            parse_mode="Markdown",
+        )
+
+
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Таск-бот*\n\n"
@@ -231,14 +259,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/status — мои задачи\n\n"
         "*Администратору:*\n"
         "Скопируй чеклист из артефакта и отправь боту.\n"
-        "/status — статус всей команды\n\n"
-        "*Формат задач:*\n"
-        "```\n**Антон**\n- [ ] задача 1\n- [ ] задача 2\n\n**Маша**\n- [ ] задача 3\n```",
+        "/status — статус всей команды",
         parse_mode="Markdown",
     )
 
 
-# ─── Обработка задач от админа ────────────────────────────────────────────────
+# ─── Получение задач от админа ────────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -250,109 +276,124 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sections = parse_tasks(text)
     if not sections:
         await update.message.reply_text(
-            "Не нашёл задач в формате чеклиста.\n"
-            "Скопируй текст из кнопки «Скопировать всё по ответственным» в артефакте.",
+            "Не нашёл задач. Скопируй текст из кнопки «Скопировать всё» в артефакте."
         )
         return
 
-    # Создаём батч
     with db() as conn:
-        cur = conn.execute(
-            "INSERT INTO batches (created) VALUES (?)", (datetime.now().isoformat(),)
-        )
+        cur = conn.execute("INSERT INTO batches (created) VALUES (?)", (datetime.now().isoformat(),))
         batch_id = cur.lastrowid
-        for person, tasks in sections.items():
-            for t in tasks:
-                conn.execute(
-                    "INSERT INTO tasks (batch_id, person, text, date) VALUES (?,?,?,?)",
-                    (batch_id, person, t["text"], t.get("date")),
-                )
 
-    # Получаем зарегистрированных пользователей
     with db() as conn:
         users = conn.execute("SELECT chat_id, name FROM users").fetchall()
     name_to_chat = {u["name"].lower(): u["chat_id"] for u in users}
 
     sent, missing = [], []
 
-    for person in sections:
-        # «Я (мои задачи)» всегда идут администратору
-        is_me_section = person.lower() in ME_ALIASES
-        target_chat = ADMIN_ID if is_me_section else None
+    for person, tasks in sections.items():
+        is_me = person.lower() in ME_ALIASES
+        target_chat = ADMIN_ID if is_me else None
 
         if not target_chat:
-            # Ищем по частичному совпадению имени
             p_lower = person.lower()
             for reg_name, reg_chat in name_to_chat.items():
                 if p_lower in reg_name or reg_name in p_lower:
                     target_chat = reg_chat
                     break
 
-        if target_chat:
-            msg_text, keyboard = build_message(person, batch_id)
+        if not target_chat:
+            missing.append(person)
+            continue
+
+        # Сохраняем задачи в БД
+        with db() as conn:
+            for i, t in enumerate(tasks):
+                conn.execute(
+                    "INSERT INTO tasks (batch_id, tg_task_id, person, text, date, msg_chat_id)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (batch_id, i + 1, person, t["text"], t.get("date"), target_chat),
+                )
+
+        # Отправляем нативный чеклист
+        result = await send_checklist(target_chat, person, tasks)
+
+        if result.get("ok"):
+            msg_id = result["result"]["message_id"]
+            with db() as conn:
+                conn.execute(
+                    "UPDATE tasks SET msg_id=? WHERE batch_id=? AND person=?",
+                    (msg_id, batch_id, person),
+                )
+            sent.append(person)
+            logger.info(f"Checklist sent to {person} (chat {target_chat}), msg_id={msg_id}")
+        else:
+            desc = result.get("description", "неизвестная ошибка")
+            logger.error(f"sendChecklist failed for {person}: {desc}")
+            # Fallback: обычное сообщение если чеклисты не поддерживаются
+            lines = [f"📋 *{person}*\n"]
+            for t in tasks:
+                line = f"☐ {t['text']}"
+                if t.get("date"):
+                    line += f" ({t['date']})"
+                lines.append(line)
             try:
                 msg = await ctx.bot.send_message(
                     chat_id=target_chat,
-                    text=msg_text,
-                    reply_markup=keyboard,
+                    text="\n".join(lines),
                     parse_mode="Markdown",
                 )
                 with db() as conn:
                     conn.execute(
-                        "UPDATE tasks SET msg_id=?, msg_chat_id=? WHERE batch_id=? AND person=?",
-                        (msg.message_id, target_chat, batch_id, person),
+                        "UPDATE tasks SET msg_id=? WHERE batch_id=? AND person=?",
+                        (msg.message_id, batch_id, person),
                     )
-                sent.append(person)
+                sent.append(f"{person} (текст)")
             except Exception as e:
-                logger.error(f"Не удалось отправить {person}: {e}")
-                missing.append(f"{person} (ошибка)")
-        else:
-            missing.append(person)
+                missing.append(f"{person} (ошибка: {e})")
 
     reply = f"✅ Батч #{batch_id} отправлен!\n"
     if sent:
-        reply += f"\n📨 Получили задачи: {', '.join(sent)}"
+        reply += f"\n📨 Получили: {', '.join(sent)}"
     if missing:
         reply += (
-            f"\n\n⚠️ Не найдены в боте: {', '.join(missing)}\n"
-            "Пусть напишут /start, затем /link с именем из задач."
+            f"\n\n⚠️ Не найдены: {', '.join(missing)}\n"
+            "Пусть напишут /start, потом /link со своим именем."
         )
     await update.message.reply_text(reply)
 
 
-# ─── Нажатие кнопки чеклиста ──────────────────────────────────────────────────
+# ─── Отслеживание отметок в чеклисте ─────────────────────────────────────────
 
-async def toggle_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def handle_any_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Ловит все апдейты — в том числе edited_message с обновлённым чеклистом.
+    Когда пользователь отмечает пункт, Telegram присылает edited_message
+    с полем checklist содержащим актуальное состояние.
+    """
+    raw = update.to_dict()
 
-    task_id = int(query.data.split(":")[1])
-    chat_id = update.effective_chat.id
+    for key in ("edited_message", "message"):
+        msg = raw.get(key, {})
+        checklist = msg.get("checklist")
+        if not checklist:
+            continue
 
-    with db() as conn:
-        row = conn.execute(
-            "SELECT done, person, batch_id, msg_chat_id FROM tasks WHERE id=?", (task_id,)
-        ).fetchone()
+        msg_id = msg.get("message_id")
+        chat_id = msg.get("chat", {}).get("id")
+        if not msg_id or not chat_id:
+            continue
 
-        if not row:
-            await query.answer("Задача не найдена", show_alert=True)
-            return
-
-        # Разрешаем тогглить только своё (или админ может всё)
-        if chat_id != ADMIN_ID and chat_id != row["msg_chat_id"]:
-            await query.answer("Это не твоя задача 🙅", show_alert=True)
-            return
-
-        new_done = 0 if row["done"] else 1
-        conn.execute("UPDATE tasks SET done=? WHERE id=?", (new_done, task_id))
-
-    msg_text, keyboard = build_message(row["person"], row["batch_id"])
-    try:
-        await query.edit_message_text(
-            text=msg_text, reply_markup=keyboard, parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.warning(f"edit_message_text: {e}")
+        tg_tasks = checklist.get("tasks", [])
+        with db() as conn:
+            for t in tg_tasks:
+                tg_id = t.get("id")
+                is_done = 1 if t.get("is_checked") else 0
+                conn.execute(
+                    "UPDATE tasks SET done=? WHERE msg_id=? AND msg_chat_id=? AND tg_task_id=?",
+                    (is_done, msg_id, chat_id, tg_id),
+                )
+        logger.info(f"Checklist update: msg_id={msg_id}, {len(tg_tasks)} tasks synced")
+        break
 
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
@@ -365,11 +406,14 @@ def main():
     app.add_handler(CommandHandler("link", cmd_link))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CallbackQueryHandler(toggle_task, pattern=r"^t:\d+$"))
+    app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot is running...")
-    app.run_polling(drop_pending_updates=True)
+    # Ловим все апдейты для синхронизации состояния чеклиста
+    app.add_handler(TypeHandler(Update, handle_any_update))
+
+    logger.info("Bot started (checklist mode)")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
