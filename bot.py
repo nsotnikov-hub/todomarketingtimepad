@@ -73,22 +73,29 @@ def db():
 def parse_tasks(text: str) -> dict[str, list[dict]]:
     sections: dict[str, list[dict]] = {}
     current = None
-    for line in text.splitlines():
-        line = line.strip()
+    # Normalize line endings and strip invisible chars
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    for line in text.split("\n"):
+        line = line.strip().strip("​\xa0")  # strip zero-width space, nbsp
         if not line:
             continue
-        bold = re.match(r"^\*\*(.+?)\*\*:?$", line)
+        # Match **Person** or **Person**: — also allow smart quotes/asterisks
+        bold = re.match(r"^[\*\*]{2}(.+?)[\*\*]{2}:?$", line) or \
+               re.match(r"^\*\*(.+?)\*\*:?\s*$", line)
         if bold:
             current = bold.group(1).strip()
             sections.setdefault(current, [])
             continue
-        task = re.match(r"^-\s*\[[ x]\]\s+(.+)$", line, re.IGNORECASE)
+        # Match - [ ] task or • task or * task as fallback
+        task = re.match(r"^[-*•]\s*\[[ xXvV✓]\]?\s+(.+)$", line) or \
+               re.match(r"^[-*•]\s+(?!\[)(.+)$", line) if current else None
         if task and current is not None:
             raw = task.group(1).strip()
             date_m = re.search(r"\(([^)]+)\)\s*$", raw)
             date = date_m.group(1) if date_m else None
             task_text = raw[: date_m.start()].strip() if date_m else raw
-            sections[current].append({"text": task_text, "date": date})
+            if task_text:
+                sections[current].append({"text": task_text, "date": date})
     return sections
 
 
@@ -209,6 +216,45 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     line += f" _({t['date']})_"
                 lines.append(line)
             await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Показывает как бот видит отправленный текст — для диагностики."""
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    if not ctx.args and not update.message.reply_to_message:
+        await update.message.reply_text(
+            "Отправь текст задач ответом на это сообщение, или напиши:\n`/debug текст задач`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if update.message.reply_to_message:
+        text = update.message.reply_to_message.text or ""
+    else:
+        text = " ".join(ctx.args)
+
+    sections = parse_tasks(text)
+
+    # Show raw repr of first 300 chars
+    raw_repr = repr(text[:300])
+    lines_info = "\n".join(
+        f"{i+1}: {repr(line)}" for i, line in enumerate(text.split("\n")[:10])
+    )
+
+    if sections:
+        result = "✅ Успешно распознал:\n"
+        for person, tasks in sections.items():
+            result += f"\n👤 {person}:\n"
+            for t in tasks:
+                result += f"  — {t['text']}"
+                if t.get("date"):
+                    result += f" ({t['date']})"
+                result += "\n"
+    else:
+        result = "❌ Задачи не найдены.\n\nПервые строки (repr):\n" + lines_info
+
+    await update.message.reply_text(result[:3000])
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -349,6 +395,7 @@ def main():
     app.add_handler(CommandHandler("link", cmd_link))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CallbackQueryHandler(toggle_task, pattern=r"^t:\d+$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
