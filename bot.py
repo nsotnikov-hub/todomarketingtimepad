@@ -123,17 +123,31 @@ def build_message(person: str, batch_id: int) -> tuple[str, InlineKeyboardMarkup
 
     done_n = sum(1 for r in rows if r["done"])
     total = len(rows)
-    header = f"📋 *{person}*\n_{done_n} из {total} выполнено_\n"
 
-    keyboard = []
-    for r in rows:
+    # Full task list in message text
+    lines = [f"📋 *{person}*", f"_{done_n} из {total} выполнено_", ""]
+    for i, r in enumerate(rows, 1):
         icon = "✅" if r["done"] else "☐"
-        label = f"{icon} {r['text']}"
+        task_line = f"{icon} {i}. {r['text']}"
         if r["date"]:
-            label += f" ({r['date']})"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"t:{r['id']}")])
+            task_line += f" ({r['date']})"
+        lines.append(task_line)
 
-    return header, InlineKeyboardMarkup(keyboard)
+    text = "\n".join(lines)
+
+    # Compact buttons: 3 per row, just "☐ 1" or "✅ 1"
+    buttons = []
+    row = []
+    for i, r in enumerate(rows, 1):
+        icon = "✅" if r["done"] else "☐"
+        row.append(InlineKeyboardButton(f"{icon} {i}", callback_data=f"t:{r['id']}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    return text, InlineKeyboardMarkup(buttons)
 
 
 # ─── Команды ──────────────────────────────────────────────────────────────────
