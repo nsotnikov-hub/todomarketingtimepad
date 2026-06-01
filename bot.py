@@ -73,22 +73,34 @@ def db():
 def parse_tasks(text: str) -> dict[str, list[dict]]:
     sections: dict[str, list[dict]] = {}
     current = None
-    # Normalize line endings and strip invisible chars
+
+    # Strip Telegram forward prefix: [01.06.2026 23:20] Username:
+    text = re.sub(r"^\[[^\]]+\]\s*[^\n:]+:\s*", "", text.strip())
+
+    # Normalize line endings
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+
     for line in text.split("\n"):
-        line = line.strip().strip("​\xa0")  # strip zero-width space, nbsp
+        line = line.strip().strip("​\xa0")
         if not line:
             continue
-        # Match **Person** or **Person**: — also allow smart quotes/asterisks
-        bold = re.match(r"^[\*\*]{2}(.+?)[\*\*]{2}:?$", line) or \
-               re.match(r"^\*\*(.+?)\*\*:?\s*$", line)
-        if bold:
-            current = bold.group(1).strip()
-            sections.setdefault(current, [])
-            continue
-        # Match - [ ] task or • task or * task as fallback
-        task = re.match(r"^[-*•]\s*\[[ xXvV✓]\]?\s+(.+)$", line) or \
-               re.match(r"^[-*•]\s+(?!\[)(.+)$", line) if current else None
+
+        # Format 1 (new): "Person name:" on its own line
+        colon_header = re.match(r"^([^:\-*•\[\]]{2,60}):\s*$", line)
+        # Format 2 (old): **Person name** or **Person name**:
+        bold_header = re.match(r"^\*{1,2}(.+?)\*{1,2}:?\s*$", line)
+
+        if colon_header or bold_header:
+            m = colon_header or bold_header
+            name = m.group(1).strip()
+            # Skip lines that look like tasks accidentally matched
+            if not re.match(r"^[-*•\[]", name):
+                current = name
+                sections.setdefault(current, [])
+                continue
+
+        # Task line: "- task", "- [ ] task", "• task"
+        task = re.match(r"^[-*•]\s*(?:\[[ xX]\]\s*)?(.+)$", line)
         if task and current is not None:
             raw = task.group(1).strip()
             date_m = re.search(r"\(([^)]+)\)\s*$", raw)
@@ -96,6 +108,7 @@ def parse_tasks(text: str) -> dict[str, list[dict]]:
             task_text = raw[: date_m.start()].strip() if date_m else raw
             if task_text:
                 sections[current].append({"text": task_text, "date": date})
+
     return sections
 
 
